@@ -42,6 +42,16 @@ def create_blueprint() -> Blueprint:
         methods=["POST"],
     )
     bp.add_url_rule(
+        "/api/token-tool/device/start",
+        view_func=token_tool_controller.start_device_code,
+        methods=["POST"],
+    )
+    bp.add_url_rule(
+        "/api/token-tool/device/poll",
+        view_func=token_tool_controller.poll_device_code,
+        methods=["POST"],
+    )
+    bp.add_url_rule(
         "/api/token-tool/save",
         view_func=token_tool_controller.save_to_account,
         methods=["POST"],

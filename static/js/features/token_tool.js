@@ -18,6 +18,9 @@ const DEFAULT_COMPAT_SCOPE = SCOPE_PRESETS.graph.join(' ');
 
 let scopeTokens = ['offline_access', 'https://graph.microsoft.com/.default'];
 let currentTokenResult = null;
+let deviceFlow = null;
+let devicePollTimer = null;
+let devicePollInFlight = false;
 
 async function tokenToolFetch(url, options = {}) {
     const headers = {
@@ -278,6 +281,128 @@ function openAuthorizeLink() {
         return;
     }
     window.open(linkInput.value, '_blank');
+}
+
+function stopDevicePolling() {
+    if (devicePollTimer) {
+        window.clearTimeout(devicePollTimer);
+        devicePollTimer = null;
+    }
+    devicePollInFlight = false;
+}
+
+function showDeviceCodeStatus(message, type = 'info', detail = '') {
+    const statusNode = document.getElementById('deviceCodeStatus');
+    if (!statusNode) {
+        showStatus(message, type, detail);
+        return;
+    }
+    statusNode.className = `token-status ${type}`;
+    statusNode.innerHTML = `
+        <div class="token-status-title">${escapeHtml(message)}</div>
+        ${detail ? `<div class="token-status-detail">${escapeHtml(detail)}</div>` : ''}
+    `;
+}
+
+function renderDeviceCodePanel(data) {
+    const panel = document.getElementById('device-code-panel');
+    panel?.classList.remove('hidden');
+
+    const userCode = document.getElementById('deviceUserCode');
+    if (userCode) {
+        userCode.textContent = data.user_code || '-';
+    }
+
+    const verifyInput = document.getElementById('deviceVerificationUri');
+    if (verifyInput) {
+        verifyInput.value = data.verification_uri_complete || data.verification_uri || '';
+    }
+
+    const message = data.message || t('设备码已生成，请打开验证页完成 Microsoft 登录');
+    showDeviceCodeStatus(t('等待 Microsoft 登录确认'), 'info', message);
+}
+
+function scheduleDevicePoll(seconds) {
+    if (!deviceFlow?.flow_id) {
+        return;
+    }
+    const delay = Math.max(1, Number(seconds || deviceFlow.interval || 5)) * 1000;
+    stopDevicePolling();
+    devicePollTimer = window.setTimeout(pollDeviceCode, delay);
+}
+
+async function startDeviceCode() {
+    stopDevicePolling();
+    clearStatus();
+    const config = collectFormConfig();
+    const data = await tokenToolFetch('/api/token-tool/device/start', {
+        method: 'POST',
+        body: JSON.stringify(config),
+    });
+    if (!data.success) {
+        showStatus(data.error?.message || t('启动设备码登录失败'), 'error', data.error?.details || '');
+        return;
+    }
+
+    deviceFlow = data.data || {};
+    renderDeviceCodePanel(deviceFlow);
+    showStatus(t('设备码已生成，请完成 Microsoft 登录'), 'success');
+    scheduleDevicePoll(deviceFlow.interval || 5);
+}
+
+async function pollDeviceCode() {
+    if (!deviceFlow?.flow_id || devicePollInFlight) {
+        return;
+    }
+    devicePollInFlight = true;
+    const data = await tokenToolFetch('/api/token-tool/device/poll', {
+        method: 'POST',
+        body: JSON.stringify({ flow_id: deviceFlow.flow_id }),
+    });
+    devicePollInFlight = false;
+
+    if (!data.success) {
+        stopDevicePolling();
+        showDeviceCodeStatus(data.error?.message || t('设备码登录失败'), 'error', data.error?.details || '');
+        showStatus(data.error?.message || t('设备码登录失败'), 'error', data.error?.details || '');
+        return;
+    }
+
+    if (data.status === 'complete') {
+        stopDevicePolling();
+        deviceFlow = null;
+        showDeviceCodeStatus(t('设备码登录完成'), 'success');
+        renderTokenResult(data.data || {});
+        return;
+    }
+
+    const pending = data.data || {};
+    showDeviceCodeStatus(t('等待 Microsoft 登录确认'), 'info', pending.message || '');
+    scheduleDevicePoll(pending.interval || deviceFlow.interval || 5);
+}
+
+function copyDeviceUserCode() {
+    const code = document.getElementById('deviceUserCode')?.textContent || '';
+    if (!code || code === '-') {
+        showStatus(t('没有可复制的验证码'), 'error');
+        return;
+    }
+    copyText(code);
+}
+
+function openDeviceVerification() {
+    const verifyInput = document.getElementById('deviceVerificationUri');
+    if (!verifyInput || !verifyInput.value) {
+        showStatus(t('没有可打开的验证页'), 'error');
+        return;
+    }
+    window.open(verifyInput.value, '_blank');
+}
+
+function cancelDeviceCodePolling() {
+    stopDevicePolling();
+    deviceFlow = null;
+    showDeviceCodeStatus(t('已停止设备码轮询'), 'info');
 }
 
 function fillResultField(id, value) {

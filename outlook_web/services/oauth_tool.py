@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 OAUTH_FLOW_STORE: Dict[str, Dict[str, Any]] = {}
 OAUTH_FLOW_LOCK = Lock()
 OAUTH_FLOW_TTL = 20 * 60  # 20 分钟 (PRD §5.1 Flow TTL)
+DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+DEVICE_CODE_PENDING_ERRORS = {"authorization_pending", "slow_down"}
+DEVICE_CODE_TERMINAL_ERRORS = {"authorization_declined", "bad_verification_code", "expired_token"}
 
 
 def _prune_expired() -> None:
@@ -169,6 +172,154 @@ def exchange_code_for_tokens(code: str, oauth_config: Dict[str, Any], verifier: 
     return result, None
 
 
+def start_device_code_flow(oauth_config: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Any]:
+    """
+    启动 Microsoft OAuth Device Code 授权流程。
+
+    Returns:
+        (safe_device_data, None)  — 成功；device_code 仅保存在服务端内存
+        (None, error_info)        — 失败
+    """
+    normalized_scope, scope_error = validate_scope(oauth_config.get("scope", ""))
+    if scope_error:
+        return None, {"message": scope_error, "config_error": True}
+
+    tenant = (oauth_config.get("tenant") or "consumers").strip() or "consumers"
+    token_url_base = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0"
+    payload = {
+        "client_id": oauth_config["client_id"],
+        "scope": normalized_scope,
+    }
+
+    try:
+        resp = requests.post(f"{token_url_base}/devicecode", data=payload, timeout=15)
+    except requests.RequestException as exc:
+        logger.error("[oauth_tool] Device Code 请求网络错误: %s", exc)
+        return None, {"message": f"无法连接 Microsoft 服务器: {exc}"}
+
+    if resp.status_code != 200:
+        error_detail = _parse_error_response(resp)
+        guidance = map_error_guidance(error_detail)
+        logger.warning("[oauth_tool] Device Code 请求失败: %s", error_detail[:200])
+        return None, {"message": error_detail, "guidance": guidance}
+
+    device_data = resp.json()
+    device_code = device_data.get("device_code")
+    if not device_code:
+        return None, {"message": "Microsoft 未返回 device_code"}
+
+    flow_id = secrets.token_urlsafe(24)
+    expires_in = _safe_int(device_data.get("expires_in"), 900)
+    interval = max(1, _safe_int(device_data.get("interval"), 5))
+    store_oauth_flow(
+        flow_id,
+        {
+            "flow_type": "device_code",
+            "client_id": oauth_config["client_id"],
+            "scope": normalized_scope,
+            "tenant": tenant,
+            "device_code": device_code,
+            "interval": interval,
+            "expires_at": time.time() + expires_in,
+        },
+    )
+
+    logger.info("[oauth_tool] Device Code 已生成 (flow=%s...)", flow_id[:8])
+    return (
+        {
+            "flow_id": flow_id,
+            "user_code": device_data.get("user_code", ""),
+            "verification_uri": device_data.get("verification_uri", ""),
+            "verification_uri_complete": device_data.get("verification_uri_complete", ""),
+            "expires_in": expires_in,
+            "interval": interval,
+            "message": device_data.get("message", ""),
+            "client_id": oauth_config["client_id"],
+            "scope": normalized_scope,
+        },
+        None,
+    )
+
+
+def poll_device_code_flow(flow_id: str) -> Tuple[Optional[Dict[str, Any]], Any]:
+    """
+    轮询 Device Code 流程。
+
+    Returns:
+        (token_data, None)                    — 用户已授权并成功换取 token
+        (None, {"pending": True, ...})        — 用户尚未完成授权，前端应继续轮询
+        (None, {"message": "...", ...})       — 终止错误
+    """
+    flow_data = get_oauth_flow(flow_id)
+    if not flow_data or flow_data.get("flow_type") != "device_code":
+        return None, {"message": "设备码授权流程不存在或已过期"}
+
+    if time.time() >= float(flow_data.get("expires_at") or 0):
+        discard_oauth_flow(flow_id)
+        return None, {
+            "error": "expired_token",
+            "message": "设备码已过期，请重新生成",
+        }
+
+    tenant = flow_data.get("tenant") or "consumers"
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    payload = {
+        "grant_type": DEVICE_CODE_GRANT_TYPE,
+        "client_id": flow_data["client_id"],
+        "device_code": flow_data["device_code"],
+    }
+
+    try:
+        resp = requests.post(token_url, data=payload, timeout=15)
+    except requests.RequestException as exc:
+        logger.error("[oauth_tool] Device Code 轮询网络错误: %s", exc)
+        return None, {"message": f"无法连接 Microsoft 服务器: {exc}"}
+
+    if resp.status_code == 200:
+        tokens = resp.json()
+        result = _extract_token_data(
+            tokens,
+            {
+                "client_id": flow_data["client_id"],
+                "redirect_uri": "",
+                "scope": flow_data["scope"],
+            },
+        )
+        result["auth_flow"] = "device_code"
+        discard_oauth_flow(flow_id)
+        logger.info("[oauth_tool] Device Code Token 换取成功 (client_id=%s...)", flow_data["client_id"][:8])
+        return result, None
+
+    error_payload = _parse_error_payload(resp)
+    error_code = str(error_payload.get("error") or "").strip()
+    error_description = str(error_payload.get("error_description") or error_code or "").strip()
+
+    if error_code in DEVICE_CODE_PENDING_ERRORS:
+        interval = max(1, _safe_int(flow_data.get("interval"), 5))
+        if error_code == "slow_down":
+            interval += 5
+            flow_data["interval"] = interval
+            # Preserve the same flow id while recording Microsoft's slower polling hint.
+            store_oauth_flow(flow_id, flow_data)
+        return None, {
+            "pending": True,
+            "error": error_code,
+            "message": error_description or "等待用户完成授权",
+            "interval": interval,
+        }
+
+    if error_code in DEVICE_CODE_TERMINAL_ERRORS:
+        discard_oauth_flow(flow_id)
+
+    error_detail = _format_error_payload(error_payload, resp)
+    guidance = map_error_guidance(error_detail)
+    return None, {
+        "error": error_code or "device_code_failed",
+        "message": error_detail,
+        "guidance": guidance,
+    }
+
+
 OIDC_SCOPES = {"openid", "profile", "email", "offline_access"}
 
 
@@ -269,15 +420,31 @@ def decode_jwt_payload(token: str) -> Optional[dict]:
 
 
 def _parse_error_response(resp) -> str:
+    err = _parse_error_payload(resp)
+    return _format_error_payload(err, resp)
+
+
+def _parse_error_payload(resp) -> dict:
     try:
         err = resp.json()
-        error_code = err.get("error") or ""
-        error_description = err.get("error_description") or ""
-        if error_code and error_description:
-            return f"{error_code}: {error_description}"
-        return error_description or error_code or resp.text[:500]
+        return err if isinstance(err, dict) else {}
     except Exception:
-        return resp.text[:500]
+        return {}
+
+
+def _format_error_payload(err: dict, resp) -> str:
+    error_code = err.get("error") or ""
+    error_description = err.get("error_description") or ""
+    if error_code and error_description:
+        return f"{error_code}: {error_description}"
+    return error_description or error_code or getattr(resp, "text", "")[:500]
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _extract_token_data(tokens: dict, oauth_config: dict) -> dict:

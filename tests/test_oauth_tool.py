@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import time
 import threading
 import unittest
 import uuid
@@ -99,6 +100,21 @@ class OAuthToolTestBase(unittest.TestCase):
             "error_description": description,
         }
         resp.text = json.dumps(resp.json.return_value)
+        return resp
+
+    @staticmethod
+    def _mock_microsoft_device_code_response():
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "device_code": "mock-device-code",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://microsoft.com/devicelogin",
+            "verification_uri_complete": "https://microsoft.com/devicelogin?otc=ABCD-EFGH",
+            "expires_in": 900,
+            "interval": 5,
+            "message": "To sign in, use a web browser to open the page...",
+        }
         return resp
 
     @staticmethod
@@ -471,6 +487,111 @@ class OAuthToolTokenExchangeTests(OAuthToolTestBase):
         self.assertEqual(result["roles_claim"], "Mail.Send")
 
 
+class OAuthToolDeviceCodeServiceTests(OAuthToolTestBase):
+    @patch("outlook_web.services.oauth_tool.requests.post")
+    def test_start_device_code_flow_stores_secret_device_code(self, mock_post):
+        from outlook_web.services import oauth_tool as oauth_tool_service
+
+        mock_post.return_value = self._mock_microsoft_device_code_response()
+        result, error = oauth_tool_service.start_device_code_flow(
+            {
+                "client_id": "device-cid",
+                "scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+                "tenant": "consumers",
+            }
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(result["user_code"], "ABCD-EFGH")
+        self.assertEqual(result["client_id"], "device-cid")
+        self.assertNotIn("device_code", result)
+        stored = oauth_tool_service.get_oauth_flow(result["flow_id"])
+        self.assertEqual(stored["device_code"], "mock-device-code")
+        self.assertEqual(stored["flow_type"], "device_code")
+        self.assertEqual(
+            mock_post.call_args.args[0],
+            "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode",
+        )
+        self.assertEqual(mock_post.call_args.kwargs["data"]["client_id"], "device-cid")
+
+    @patch("outlook_web.services.oauth_tool.requests.post")
+    def test_start_device_code_flow_rejects_invalid_scope(self, mock_post):
+        from outlook_web.services.oauth_tool import start_device_code_flow
+
+        result, error = start_device_code_flow(
+            {
+                "client_id": "device-cid",
+                "scope": "offline_access",
+                "tenant": "consumers",
+            }
+        )
+
+        self.assertIsNone(result)
+        self.assertIn("至少需要一个 API scope", error["message"])
+        mock_post.assert_not_called()
+
+    @patch("outlook_web.services.oauth_tool.requests.post")
+    def test_poll_device_code_flow_pending(self, mock_post):
+        from outlook_web.services import oauth_tool as oauth_tool_service
+
+        oauth_tool_service.store_oauth_flow(
+            "flow-pending",
+            {
+                "flow_type": "device_code",
+                "client_id": "device-cid",
+                "scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+                "tenant": "consumers",
+                "device_code": "mock-device-code",
+                "interval": 5,
+                "expires_at": time.time() + 300,
+            },
+        )
+        mock_post.return_value = self._mock_microsoft_error_response(
+            "authorization_pending",
+            "Authorization is still pending.",
+        )
+
+        result, error = oauth_tool_service.poll_device_code_flow("flow-pending")
+
+        self.assertIsNone(result)
+        self.assertTrue(error["pending"])
+        self.assertEqual(error["error"], "authorization_pending")
+        self.assertIsNotNone(oauth_tool_service.get_oauth_flow("flow-pending"))
+
+    @patch("outlook_web.services.oauth_tool.requests.post")
+    def test_poll_device_code_flow_success_discards_flow(self, mock_post):
+        from outlook_web.services import oauth_tool as oauth_tool_service
+
+        oauth_tool_service.store_oauth_flow(
+            "flow-success",
+            {
+                "flow_type": "device_code",
+                "client_id": "device-cid",
+                "scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+                "tenant": "consumers",
+                "device_code": "mock-device-code",
+                "interval": 5,
+                "expires_at": time.time() + 300,
+            },
+        )
+        mock_post.return_value = self._mock_microsoft_token_response(
+            access_token="device-at",
+            refresh_token="device-rt",
+            scope="offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+        )
+
+        result, error = oauth_tool_service.poll_device_code_flow("flow-success")
+
+        self.assertIsNone(error)
+        self.assertEqual(result["refresh_token"], "device-rt")
+        self.assertEqual(result["auth_flow"], "device_code")
+        self.assertIsNone(oauth_tool_service.get_oauth_flow("flow-success"))
+        self.assertEqual(
+            mock_post.call_args.kwargs["data"]["grant_type"],
+            "urn:ietf:params:oauth:grant-type:device_code",
+        )
+
+
 class OAuthToolApiPrepareTests(OAuthToolTestBase):
     def test_prepare_returns_auth_url(self):
         from urllib.parse import parse_qs, urlparse
@@ -708,6 +829,102 @@ class OAuthToolApiExchangeTests(OAuthToolTestBase):
                 },
             )
             self.assertEqual(resp.status_code, 401)
+
+
+class OAuthToolApiDeviceCodeTests(OAuthToolTestBase):
+    @patch("outlook_web.services.oauth_tool.requests.post")
+    def test_device_start_returns_public_fields_only(self, mock_post):
+        mock_post.return_value = self._mock_microsoft_device_code_response()
+
+        with self.app.test_client() as client:
+            self._login(client)
+            resp = client.post(
+                "/api/token-tool/device/start",
+                json={
+                    "client_id": "device-cid",
+                    "tenant": "consumers",
+                    "scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+                },
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json().get("data", {})
+        self.assertTrue(data.get("flow_id"))
+        self.assertEqual(data.get("user_code"), "ABCD-EFGH")
+        self.assertNotIn("device_code", data)
+
+    @patch("outlook_web.services.oauth_tool.requests.post")
+    def test_device_poll_pending(self, mock_post):
+        mock_post.side_effect = [
+            self._mock_microsoft_device_code_response(),
+            self._mock_microsoft_error_response("authorization_pending", "Authorization is still pending."),
+        ]
+
+        with self.app.test_client() as client:
+            self._login(client)
+            start_resp = client.post(
+                "/api/token-tool/device/start",
+                json={
+                    "client_id": "device-cid",
+                    "tenant": "consumers",
+                    "scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+                },
+            )
+            flow_id = start_resp.get_json().get("data", {}).get("flow_id")
+            poll_resp = client.post("/api/token-tool/device/poll", json={"flow_id": flow_id})
+
+        self.assertEqual(poll_resp.status_code, 200)
+        self.assertEqual(poll_resp.get_json().get("status"), "pending")
+        self.assertEqual(poll_resp.get_json().get("data", {}).get("error"), "authorization_pending")
+
+    @patch("outlook_web.services.oauth_tool.requests.post")
+    def test_device_poll_success(self, mock_post):
+        mock_post.side_effect = [
+            self._mock_microsoft_device_code_response(),
+            self._mock_microsoft_token_response(
+                access_token="device-at",
+                refresh_token="device-rt",
+                scope="offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+            ),
+        ]
+
+        with self.app.test_client() as client:
+            self._login(client)
+            start_resp = client.post(
+                "/api/token-tool/device/start",
+                json={
+                    "client_id": "device-cid",
+                    "tenant": "consumers",
+                    "scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+                },
+            )
+            flow_id = start_resp.get_json().get("data", {}).get("flow_id")
+            poll_resp = client.post("/api/token-tool/device/poll", json={"flow_id": flow_id})
+
+        self.assertEqual(poll_resp.status_code, 200)
+        body = poll_resp.get_json()
+        self.assertEqual(body.get("status"), "complete")
+        self.assertEqual(body.get("data", {}).get("refresh_token"), "device-rt")
+        self.assertEqual(body.get("data", {}).get("auth_flow"), "device_code")
+
+    def test_device_start_requires_login(self):
+        with self.app.test_client() as client:
+            resp = client.post(
+                "/api/token-tool/device/start",
+                json={
+                    "client_id": "device-cid",
+                    "tenant": "consumers",
+                    "scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+                },
+            )
+            self.assertEqual(resp.status_code, 401)
+
+    def test_device_poll_rejects_unknown_session_flow(self):
+        with self.app.test_client() as client:
+            self._login(client)
+            resp = client.post("/api/token-tool/device/poll", json={"flow_id": "other-flow"})
+            self.assertEqual(resp.status_code, 400)
+            self.assertEqual(resp.get_json().get("code"), "OAUTH_MICROSOFT_AUTH_FAILED")
 
 
 class OAuthToolApiConfigTests(OAuthToolTestBase):
