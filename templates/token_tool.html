@@ -128,29 +128,7 @@
                 </label>
                 <div class="token-button-row">
                     <button type="button" class="btn-inline" onclick="saveConfig()">保存配置</button>
-                    <button type="button" class="btn-inline" onclick="startDeviceCode()">设备码登录</button>
                     <button type="button" class="btn-inline primary" onclick="startOAuth()">获取授权链接</button>
-                </div>
-            </div>
-        </section>
-
-        <section id="device-code-panel" class="token-card hidden">
-            <div class="token-card-title">② 设备码登录</div>
-            <div id="deviceCodeStatus" class="token-status hidden" role="status"></div>
-            <div class="device-code-layout">
-                <div class="device-code-value">
-                    <span>验证码</span>
-                    <strong id="deviceUserCode">-</strong>
-                </div>
-                <div class="token-field token-field-full">
-                    <span>Microsoft 验证地址</span>
-                    <div class="authorize-link-row">
-                        <input id="deviceVerificationUri" type="text" class="form-input authorize-link-input" readonly>
-                        <button type="button" class="btn-inline" onclick="copyDeviceUserCode()">复制验证码</button>
-                        <button type="button" class="btn-inline" onclick="openDeviceVerification()">打开验证页</button>
-                        <button type="button" class="btn-inline ghost" onclick="cancelDeviceCodePolling()">停止轮询</button>
-                    </div>
-                    <small class="token-field-hint">在打开的 Microsoft 页面输入上方验证码并完成登录，本工具会自动换取 Token。</small>
                 </div>
             </div>
         </section>
